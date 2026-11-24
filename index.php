@@ -11,6 +11,7 @@ declare(strict_types=1);
 const APP_PASSWORD  = 'librifydict';              // CHANGE THIS. Use '' to turn the login off (not recommended).
 const STORAGE_DIR   = __DIR__ . '/storage';    // Where the files live (created automatically).
 const MAX_EDIT_SIZE = 2 * 1024 * 1024;         // Largest text file the editor will open/save (bytes).
+const LOG_FILE      = __DIR__ . '/logs/upload-failures.log';   // Every failed upload is recorded here.
 const BLOCKED_EXT   = ['php','php3','php4','php5','php7','php8','phtml','pht','phps','phar','cgi','htaccess','htpasswd'];
 
 const KINDS = [
@@ -33,10 +34,12 @@ session_name('fm_session');
 session_set_cookie_params(['httponly' => true, 'samesite' => 'Strict']);
 session_start();
 
-if (!is_dir(STORAGE_DIR)) { @mkdir(STORAGE_DIR, 0755, true); }
-$guard = STORAGE_DIR . '/.htaccess';   // Files are only reachable through this script on Apache.
-if (is_dir(STORAGE_DIR) && !is_file($guard)) {
-    @file_put_contents($guard, "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nDeny from all\n</IfModule>\n");
+foreach ([STORAGE_DIR, dirname(LOG_FILE)] as $protected) {   // Only reachable through this script on Apache.
+    if (!is_dir($protected)) { @mkdir($protected, 0755, true); }
+    $guard = $protected . '/.htaccess';
+    if (is_dir($protected) && !is_file($guard)) {
+        @file_put_contents($guard, "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nDeny from all\n</IfModule>\n");
+    }
 }
 if (empty($_SESSION['csrf'])) { $_SESSION['csrf'] = bin2hex(random_bytes(16)); }
 
@@ -102,6 +105,23 @@ function rrmdir(string $d): bool {
         if (is_dir($p) && !is_link($p)) rrmdir($p); else @unlink($p);
     }
     return @rmdir($d);
+}
+function log_clean(string $s, int $max): string {
+    $s = preg_replace('/[\x00-\x1F\x7F]+/', ' ', $s) ?? '';
+    return strlen($s) > $max ? substr($s, 0, $max) . '…' : $s;
+}
+/** Append one line to the failed-upload log: time | IP | folder | file (size) | reason */
+function log_upload_failure(string $folder, string $name, string $reason, ?int $size = null): void {
+    $dir = dirname(LOG_FILE);
+    if (!is_dir($dir)) { @mkdir($dir, 0755, true); }
+    $line = sprintf("%s | %s | %s | %s%s | %s\n",
+        date('Y-m-d H:i:s'),
+        log_clean((string)($_SERVER['REMOTE_ADDR'] ?? '-'), 45),
+        log_clean($folder === '' ? '/' : $folder, 300),
+        $name === '' ? '(unknown file)' : log_clean($name, 255),
+        $size !== null ? ' (' . fmt_size($size) . ')' : '',
+        log_clean($reason, 300));
+    @file_put_contents(LOG_FILE, $line, FILE_APPEND | LOCK_EX);
 }
 function ext_of(string $name): string { return strtolower(pathinfo($name, PATHINFO_EXTENSION)); }
 function kind_of(string $name): string {
@@ -336,8 +356,7 @@ if (!$authed) {
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign in</title><style><?= $CSS ?></style></head>
 <body><div class="login"><form method="post">
-<h1>Librify Backup Remote File Server</h1>
-<h5>Sign in to your files</h5>
+<h1>Sign in to your files</h1>
 <label for="pw">Password</label>
 <input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>
 <?php if ($error): ?><p class="err" role="alert"><?= h($error) ?></p><?php endif; ?>
@@ -356,21 +375,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'upload':
             $curRel = clean_rel((string)($_POST['p'] ?? ''));
             $sub    = clean_rel((string)($_POST['rel'] ?? ''));
-            if ($curRel === null || $sub === null) fail('Invalid folder.');
-            if (empty($_FILES['file'])) fail('File is larger than the server limit (' . fmt_size(upload_limit()) . ').');
-            $f = $_FILES['file'];
-            if ($f['error'] !== UPLOAD_ERR_OK) fail(upload_error((int)$f['error']));
-            $name = trim(basename(str_replace('\\', '/', (string)$f['name'])));
-            if (!valid_name($name, true)) fail("“{$name}” has a name or file type that isn’t allowed.");
+            $f      = $_FILES['file'] ?? null;
+            $name   = $f ? trim(basename(str_replace('\\', '/', (string)$f['name']))) : trim(rawurldecode((string)($_SERVER['HTTP_X_FILE_NAME'] ?? '')));
+            $size   = $f ? (int)$f['size'] : (isset($_SERVER['HTTP_X_FILE_SIZE']) ? (int)$_SERVER['HTTP_X_FILE_SIZE'] : null);
+            $where  = '/' . trim(($curRel ?? '') . '/' . ($sub ?? ''), '/');
+            $bad    = function (string $msg, int $code = 400) use ($where, $name, $size): void {
+                log_upload_failure($where, $name, $msg, $size);
+                fail($msg, $code);
+            };
+            if ($curRel === null || $sub === null) $bad('Invalid folder.');
+            if (!$f) $bad('File is larger than the server limit (' . fmt_size(upload_limit()) . ').');
+            if ($f['error'] !== UPLOAD_ERR_OK) $bad(upload_error((int)$f['error']));
+            if (!valid_name($name, true)) $bad("“{$name}” has a name or file type that isn’t allowed.");
             $targetRel = trim($curRel . '/' . $sub, '/');
             if ($sub !== '') {
-                foreach (explode('/', $sub) as $seg) { if (!valid_name($seg, false)) fail('Invalid folder name in the upload.'); }
+                foreach (explode('/', $sub) as $seg) { if (!valid_name($seg, false)) $bad('Invalid folder name in the upload.'); }
                 $full = root() . '/' . $targetRel;
-                if (!is_dir($full) && !@mkdir($full, 0755, true)) fail('Could not create the folder.');
+                if (!is_dir($full) && !@mkdir($full, 0755, true)) $bad('Could not create the folder.', 500);
             }
             $dir = resolve($targetRel);
-            if ($dir === null || !is_dir($dir)) fail('Folder not found.', 404);
-            if (!move_uploaded_file($f['tmp_name'], unique_path($dir, $name))) fail('Could not save the file. Check folder permissions.', 500);
+            if ($dir === null || !is_dir($dir)) $bad('Folder not found.', 404);
+            if (!move_uploaded_file($f['tmp_name'], unique_path($dir, $name))) $bad('Could not save the file. Check folder permissions.', 500);
+            json_out(['ok' => true]);
+
+        case 'logfail':   // failures the browser saw but the server never did (network drops, bad responses)
+            $where = clean_rel((string)($_POST['p'] ?? '')) ?? '';
+            log_upload_failure('/' . $where, (string)($_POST['name'] ?? ''), (string)($_POST['reason'] ?? 'Unknown error'), isset($_POST['size']) ? (int)$_POST['size'] : null);
             json_out(['ok' => true]);
 
         case 'mkdir':
@@ -748,10 +778,13 @@ function xhrUpload({ file, rel }, onProgress) {
     const x = new XMLHttpRequest();
     x.open('POST', '?a=upload');
     x.setRequestHeader('X-CSRF-Token', CSRF);
+    x.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+    x.setRequestHeader('X-File-Size', String(file.size));
     x.upload.onprogress = e => e.lengthComputable && onProgress(e.loaded / e.total * 100);
     x.onload = () => {
       let j; try { j = JSON.parse(x.responseText); } catch { return reject(new Error(`Server error (${x.status}).`)); }
-      j.ok ? resolve() : reject(new Error(j.error));
+      if (j.ok) return resolve();
+      const e = new Error(j.error); e.logged = true; reject(e);   // the server already logged this one
     };
     x.onerror = () => reject(new Error('Network error.'));
     const fd = new FormData();
@@ -773,11 +806,19 @@ async function uploadAll(list) {
     try {
       await xhrUpload(it, p => { $('i', row).style.width = p + '%'; $('span', row).textContent = Math.round(p) + '%'; });
       $('span', row).textContent = 'Done';
-    } catch (err) { failed++; row.classList.add('bad'); $('.msg', row).textContent = err.message; $('span', row).textContent = 'Failed'; }
+    } catch (err) {
+      failed++;
+      if (!err.logged) post('logfail', { p: [CUR, it.rel].filter(Boolean).join('/'), name: it.file.name, size: it.file.size, reason: err.message }).catch(() => {});
+      row.classList.add('bad'); $('.msg', row).textContent = err.message; $('span', row).textContent = 'Failed'; }
   }
   uploading = false;
   if (!failed) location.reload();
-  else { const b = document.createElement('button'); b.className = 'btn'; b.textContent = 'Reload folder'; b.onclick = () => location.reload(); b.style.marginTop = '.5rem'; box.append(b); }
+  else {
+    const note = document.createElement('p'); note.style.cssText = 'margin:.6rem 0 0;font-size:.82rem;color:var(--muted)';
+    note.textContent = `${failed} failed. Details are saved in logs/upload-failures.log on the server.`;
+    const b = document.createElement('button'); b.className = 'btn'; b.textContent = 'Reload folder'; b.onclick = () => location.reload(); b.style.marginTop = '.5rem';
+    box.append(note, b);
+  }
 }
 $('#pickFiles').addEventListener('change', e => { uploadAll([...e.target.files].map(file => ({ file, rel: '' }))); e.target.value = ''; });
 $('#pickDir').addEventListener('change', e => {
